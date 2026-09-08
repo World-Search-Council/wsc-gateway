@@ -1,0 +1,14 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+redis>=5.0.0
+aio_pika>=9.3.0
+aiomysql>=0.2.0
+clickhouse-connect>=0.6.0
+cryptography>=41.0.0
+httpx
+tldextract
+aiohttp
+cert_human>=1.0.6
+deepdiff>=6.7.0
+

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.env
+GeoLite2-City.mmdb
+*.tar.gz
+*.log

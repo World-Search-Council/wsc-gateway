@@ -1,0 +1,13 @@
+aio-pika>=9.3.0
+clickhouse-connect>=0.6.0
+cryptography
+geoip2
+httpx>=0.27.0
+pprintpp
+user-agents>=2.2.0
+tldextract>=3.4.0
+cert_human>=1.0.6
+deepdiff>=6.7.0
+redis
+# Note: for production add asyncio etc. are stdlib
+# GeoLite2-City.mmdb must be provided (volume or baked)

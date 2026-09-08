@@ -1,0 +1,191 @@
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v2.11
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-your@email.com}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+      # Uncomment for Traefik dashboard (insecure, only for dev):
+      # - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-letsencrypt:/letsencrypt
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    ports:
+      - "8001:8000"
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_USER=${DB_USER}
+      - DB_PASS=${DB_PASS}
+      - DB_NAME=${DB_NAME:-wsc_analytics}
+      - REDIS_URL=${REDIS_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASS=${CLICKHOUSE_PASS}
+      - WSC_HEADLESS_SERVERS=${WSC_HEADLESS_SERVERS:-http://127.0.0.1:8081}
+      - WSC_HEADLESS_API_KEY=${WSC_HEADLESS_API_KEY:-wsc-headless-secret-key}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gateway.rule=Host(`${TRAEFIK_DOMAIN:-gateway.localhost}`)"
+      - "traefik.http.routers.gateway.entrypoints=websecure"
+      - "traefik.http.routers.gateway.tls.certresolver=letsencrypt"
+      - "traefik.http.services.gateway.loadbalancer.server.port=8000"
+
+      # Rate limiting (best practice against scanners)
+      - "traefik.http.middlewares.ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.ratelimit.ratelimit.burst=40"
+      - "traefik.http.routers.gateway.middlewares=ratelimit,secureheaders"
+
+      # Security headers
+      - "traefik.http.middlewares.secureheaders.headers.frameDeny=true"
+      - "traefik.http.middlewares.secureheaders.headers.sslRedirect=true"
+      - "traefik.http.middlewares.secureheaders.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.secureheaders.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.secureheaders.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.secureheaders.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.secureheaders.headers.stsPreload=true"
+
+      # Optional: also allow HTTP for testing (redirects to HTTPS)
+      - "traefik.http.routers.gateway-http.rule=Host(`${TRAEFIK_DOMAIN:-gateway.localhost}`)"
+      - "traefik.http.routers.gateway-http.entrypoints=web"
+      - "traefik.http.routers.gateway-http.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    restart: unless-stopped
+
+  # Dispatcher: lightweight decision maker (usually 1 replica)
+  dispatcher:
+    build: ./worker
+    command: python dispatcher.py
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASS=${CLICKHOUSE_PASS}
+      - GEOIP_DB_PATH=/app/GeoLite2-City.mmdb
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./GeoLite2-City.mmdb:/app/GeoLite2-City.mmdb:ro
+    restart: unless-stopped
+
+  # Ingest worker: high volume event processing (scale with replicas)
+  worker-ingest:
+    build: ./worker
+    command: python ingest.py
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASS=${CLICKHOUSE_PASS}
+      - GEOIP_DB_PATH=/app/GeoLite2-City.mmdb
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./GeoLite2-City.mmdb:/app/GeoLite2-City.mmdb:ro
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # Report generator: assembles and pushes dashboard reports (scale independently)
+  worker-report:
+    build: ./worker
+    command: python report_generator.py
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASS=${CLICKHOUSE_PASS}
+      - GEOIP_DB_PATH=/app/GeoLite2-City.mmdb
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./GeoLite2-City.mmdb:/app/GeoLite2-City.mmdb:ro
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # PageSpeed Worker: runs headless browser audits and pushes results to ClickHouse & CMS
+  worker-pagespeed:
+    build: ./worker
+    command: python pagespeed_worker.py
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASS=${CLICKHOUSE_PASS}
+      - WSC_HEADLESS_SERVERS=${WSC_HEADLESS_SERVERS:-http://127.0.0.1:8081}
+      - WSC_HEADLESS_API_KEY=${WSC_HEADLESS_API_KEY:-wsc-headless-secret-key}
+      - WSC_GATEWAY_INTERNAL_URL=http://gateway:8000
+      - LOG_LEVEL=INFO
+    stop_grace_period: 2s
+    restart: unless-stopped
+
+  # Sentinel Worker: deep domain health, DNS, SSL, security headers & drift audits
+  worker-sentinel:
+    build: ./worker-sentinel
+    command: python sentinel_worker.py
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASS=${CLICKHOUSE_PASS}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - WSC_GATEWAY_INTERNAL_URL=http://gateway:8000
+      - LOG_LEVEL=INFO
+    stop_grace_period: 2s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Internal only - no port exposure needed unless you want external access
+    restart: unless-stopped
+
+volumes:
+  traefik-letsencrypt:
+
+# Usage example:
+# Create .env with:
+# RABBITMQ_URL=amqps://...
+# CLICKHOUSE_HOST=...
+# TRAEFIK_DOMAIN=gateway.yourdomain.com
+# ACME_EMAIL=admin@yourdomain.com
+# Then: docker compose --env-file .env up --build
+#
+# IMPORTANT for GeoIP:
+# - Place GeoLite2-City.mmdb in this directory (same as docker-compose.yml)
+# - It will be mounted to /app/GeoLite2-City.mmdb inside the workers
+# - Worker startup will HARD FAIL if the DB is missing (strict requirement)
+#
+# Scaling:
+#   docker compose up --scale worker-ingest=4 --scale worker-report=3
+#
+# The split allows independent scaling of ingest (high volume) and report generation.
+#
+# To force a resync for one project, send to wsc_trigger_reports queue:
+#   {"project_id": "proj_xxx", "force": true}
+#
+# Public access: https://gateway.yourdomain.com (via Traefik + Let's Encrypt)
+# Internal Docker access (e.g. from worker): http://gateway:8000
+#
+# Note: Remove direct 8000 mapping to avoid conflict with Portainer.
+# Traefik listens on 443 for public HTTPS.
+# For local testing without real domain, set TRAEFIK_DOMAIN=gateway.localhost
+# and use http://gateway.localhost (or add self-signed certs).
