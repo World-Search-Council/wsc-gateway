@@ -47,6 +47,9 @@ async def process_sentinel_task(message: aio_pika.IncomingMessage, channel: aio_
         task_data = {}
         try:
             task_data = json.loads(message.body.decode("utf-8"))
+            if not isinstance(task_data, dict):
+                logger.error(f"Invalid message format in wsc_sentinel_tasks: expected dict, got {type(task_data)}")
+                return
         except Exception as e:
             logger.error(f"Invalid message format in wsc_sentinel_tasks: {e}")
             return

@@ -224,9 +224,13 @@ async def get_reports(
     include_daily: bool = Query(True, description="Whether to include daily aggregated overview time-series"),
     card_types: Optional[str] = Query(None, description="Comma-separated card types filter (e.g. card1_traffic,card2_insights,card3_bots)"),
     trigger_push: bool = Query(False, description="Optionally trigger an asynchronous background worker report push"),
+    force: bool = Query(False, description="Optionally force immediate generation bypassing rate limit and activity checks"),
+    dev_mode: bool = Query(False, description="Optionally flag project/request as developer mode"),
     sig: Optional[str] = Query(None, description="Optional query parameter signature"),
     x_wsc_sig: Optional[str] = Header(None, description="HMAC-SHA256 signature"),
-    x_wsc_time: Optional[str] = Header(None, description="Timestamp for signature calculation")
+    x_wsc_time: Optional[str] = Header(None, description="Timestamp for signature calculation"),
+    x_wsc_dev_mode: Optional[str] = Header(None, description="Developer mode flag from CMS"),
+    x_wsc_force: Optional[str] = Header(None, description="Force flag from CMS")
 ):
     """
     On-Demand & Historical Reports Endpoint
@@ -246,6 +250,16 @@ async def get_reports(
         if not _verify_hmac_auth(project_id, api_secret, request, x_wsc_sig, x_wsc_time, sig):
             raise HTTPException(status_code=401, detail="Invalid HMAC signature")
 
+    is_force = force or (x_wsc_force in ("1", "true", "yes"))
+    is_dev = dev_mode or (x_wsc_dev_mode in ("1", "true", "yes"))
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client and is_dev:
+        try:
+            await redis_client.set(f"project:{project_id}:dev_mode", "1", ex=86400)
+        except Exception as e:
+            logger.debug(f"Could not cache dev_mode in Redis: {e}")
+
     ch_client = getattr(request.app.state, "clickhouse", None)
     if not ch_client:
         try:
@@ -255,17 +269,24 @@ async def get_reports(
             pass
 
     # Handle optional background push trigger via RabbitMQ
-    if trigger_push and hasattr(request.app.state, "rabbitmq_channel"):
+    should_trigger = trigger_push or is_force or is_dev
+    if should_trigger and hasattr(request.app.state, "rabbitmq_channel"):
         try:
             import aio_pika
             channel = request.app.state.rabbitmq_channel
             if channel:
-                trigger_msg = {"project_id": project_id, "force": True, "reason": "rest_get_trigger"}
+                trigger_msg = {
+                    "project_id": project_id,
+                    "force": True,
+                    "dev_mode": is_dev,
+                    "reason": "forced_rest_trigger" if is_force else ("dev_mode_trigger" if is_dev else "rest_get_trigger")
+                }
                 msg = aio_pika.Message(
                     json.dumps(trigger_msg).encode(),
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT
                 )
                 await channel.default_exchange.publish(msg, routing_key="wsc_trigger_reports")
+                logger.info(f"Published trigger with force=True (dev_mode={is_dev}) for {project_id}")
         except Exception as e:
             logger.warning(f"Could not publish trigger report to queue: {e}")
 

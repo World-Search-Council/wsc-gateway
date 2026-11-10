@@ -70,6 +70,9 @@ async def process_pagespeed_task(message: aio_pika.IncomingMessage, ch_client):
         task_data = {}
         try:
             task_data = json.loads(message.body.decode("utf-8"))
+            if not isinstance(task_data, dict):
+                logger.error(f"Invalid message format in wsc_pagespeed_tasks: expected dict, got {type(task_data)}")
+                return
         except Exception as e:
             logger.error(f"Invalid message format in wsc_pagespeed_tasks: {e}")
             return

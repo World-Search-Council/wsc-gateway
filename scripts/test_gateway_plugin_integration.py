@@ -113,7 +113,7 @@ def main():
     log_step("TEST 2: SpeedSentinel Lab Audit (POST /v1/pagespeed/audit)")
     speed_payload = {
         "project_id": project_id,
-        "url": "https://worldseocouncil.com",
+        "url": "https://worldsearchcouncil.org",
         "strategy": "mobile"
     }
     speed_raw = json.dumps(speed_payload).encode("utf-8")
@@ -137,7 +137,7 @@ def main():
     log_step("TEST 3: Sentinel Domain & Tech Health Scan (POST /v1/sentinel/scan)")
     sentinel_payload = {
         "project_id": project_id,
-        "domain": "worldseocouncil.com"
+        "domain": "worldsearchcouncil.org"
     }
     sent_raw = json.dumps(sentinel_payload).encode("utf-8")
     sent_sig = make_signature(sent_raw, api_secret)
@@ -159,7 +159,7 @@ def main():
     log_step("TEST 4: AI Coverage URL Inspector (POST /v1/ai-coverage/query)")
     ai_cov_payload = {
         "project_id": project_id,
-        "query": "https://worldseocouncil.com/standards/ai-search",
+        "query": "https://worldsearchcouncil.org/standards/ai-search",
         "timeframe_days": 30
     }
     ai_raw = json.dumps(ai_cov_payload).encode("utf-8")

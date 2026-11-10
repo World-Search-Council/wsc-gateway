@@ -109,6 +109,9 @@ async def process_message(message: aio_pika.IncomingMessage, channel=None):
     async with message.process(ignore_processed=True):
         try:
             body = json.loads(message.body.decode())
+            if not isinstance(body, dict):
+                logger.error(f"Worker received non-dict message body ({type(body)}): {str(body)[:200]}")
+                return
             project_id = body.get("project_id")
             local_aes_key = body.get("local_aes_key")
             raw_events_batch = body.get("raw_events", [])
@@ -119,7 +122,7 @@ async def process_message(message: aio_pika.IncomingMessage, channel=None):
                 encrypted_payload = sqlite_row.get("payload")
                 decrypted_batch = decrypt_payload(encrypted_payload, local_aes_key)
 
-                if not decrypted_batch:
+                if not decrypted_batch or not isinstance(decrypted_batch, dict):
                     continue
 
                 # DEBUG: Log the full decrypted payload (very useful for IP/GeoIP troubleshooting)
@@ -447,44 +450,107 @@ async def handle_reports_trigger_as_dispatcher(message: aio_pika.IncomingMessage
     Only then publishes a task to wsc_report_tasks for the report generator.
 
     This allows the decision logic to be lightweight and separate from heavy report generation.
+    Supports single dicts, lists of projects/dicts, empty lists, or plain strings.
     """
     try:
         pub_channel = channel or message.channel
-        body = json.loads(message.body.decode()) if message.body else {}
-        project_id = body.get("project_id")
+        raw_bytes = message.body or b""
 
-        force = body.get("force", False) or body.get("resync", False)
-
-        if not project_id:
-            logger.info("Dispatcher: No project_id – discovering active projects...")
-            projects = await get_active_projects()
-            if not projects:
-                logger.info("Dispatcher: No active projects found.")
+        # Safely parse JSON payload
+        triggers = []
+        if not raw_bytes or not raw_bytes.strip():
+            triggers.append({})
+        else:
+            try:
+                body = json.loads(raw_bytes.decode("utf-8"))
+            except Exception as je:
+                logger.warning(f"Dispatcher received unparseable non-JSON payload ({je}): {raw_bytes[:200]}")
+                # Acknowledge and discard corrupt/unparseable messages to prevent infinite poison-pill loops
                 await message.ack()
                 return
-            for pid in projects:
-                if force or await _should_generate_report(pid):
-                    await _publish_report_task(pub_channel, pid)
-            await message.ack()
-            return
 
-        if force or await _should_generate_report(project_id):
-            await _publish_report_task(pub_channel, project_id)
-        else:
-            # Detailed skip reason is already logged inside _should_generate_report
-            logger.info(f"Dispatcher: Skipping report generation for {project_id} (see previous log for reason)")
+            if isinstance(body, dict):
+                triggers.append(body)
+            elif isinstance(body, list):
+                if not body:
+                    # Empty list behaves like general trigger (discover all active projects)
+                    triggers.append({})
+                else:
+                    for elem in body:
+                        if isinstance(elem, dict):
+                            triggers.append(elem)
+                        elif isinstance(elem, str) and elem.strip():
+                            triggers.append({"project_id": elem.strip()})
+                        else:
+                            logger.warning(f"Dispatcher ignoring invalid list element ({type(elem)}): {elem}")
+            elif isinstance(body, str) and body.strip():
+                triggers.append({"project_id": body.strip()})
+            else:
+                logger.warning(f"Dispatcher received unexpected payload type ({type(body)}): {body}")
+                await message.ack()
+                return
+
+        for trigger_item in (triggers if triggers else [{}]):
+            project_id = trigger_item.get("project_id")
+            force = trigger_item.get("force", False) or trigger_item.get("resync", False)
+            is_dev = trigger_item.get("dev_mode", False) or trigger_item.get("is_dev", False)
+
+            if not project_id:
+                logger.info("Dispatcher: No project_id – discovering active projects...")
+                projects = await get_active_projects()
+                if not projects:
+                    logger.info("Dispatcher: No active projects found.")
+                    continue
+                for pid in projects:
+                    if force or is_dev or await _should_generate_report(pid, force=force, is_dev=is_dev):
+                        await _publish_report_task(pub_channel, pid, force=force, is_dev=is_dev)
+                continue
+
+            if force or is_dev or await _should_generate_report(project_id, force=force, is_dev=is_dev):
+                await _publish_report_task(pub_channel, project_id, force=force, is_dev=is_dev)
+            else:
+                # Detailed skip reason is already logged inside _should_generate_report
+                logger.info(f"Dispatcher: Skipping report generation for {project_id} (see previous log for reason)")
 
         await message.ack()
     except Exception as e:
-        logger.error(f"Error in dispatcher: {e}")
-        await message.nack(requeue=True)
+        logger.error(f"Error in dispatcher: {e}", exc_info=True)
+        # Poison pill protection: If redelivered, drop to prevent crash-looping
+        if getattr(message, "redelivered", False):
+            logger.warning("Dispatcher: Message was already redelivered; dropping to prevent poison-pill crash loop.")
+            await message.ack()
+        else:
+            await message.nack(requeue=False)
 
 
-async def _should_generate_report(project_id: str) -> bool:
+async def _should_generate_report(project_id: str, force: bool = False, is_dev: bool = False) -> bool:
     """Early check before publishing a report task.
     Returns True only if we should generate reports.
     Detailed skip reasons are logged at INFO level for easy observation.
     """
+    if force:
+        logger.info(f"Dispatcher: Force flag active for {project_id} — bypassing rate limit and activity checks.")
+        return True
+
+    if is_dev:
+        logger.info(f"Dispatcher: Dev mode active for {project_id} — bypassing rate limit and activity checks.")
+        return True
+
+    # Global environment override (useful for local development & testing)
+    if os.getenv("DISABLE_REPORT_RATE_LIMIT", "").lower() in ("true", "1", "yes"):
+        logger.info(f"Dispatcher: Global rate limit disabled via env — proceeding for {project_id}.")
+        return True
+
+    try:
+        global redis_client
+        if redis_client:
+            dev_flag = await redis_client.get(f"project:{project_id}:dev_mode")
+            if dev_flag:
+                logger.info(f"Dispatcher: Project {project_id} flagged as dev_mode in Redis — bypassing rate limit.")
+                return True
+    except Exception as e:
+        logger.debug(f"Redis dev_mode check failed for {project_id}: {e}")
+
     # 1. Rate limit check
     try:
         last = ch_client.query("""
@@ -526,9 +592,9 @@ async def _should_generate_report(project_id: str) -> bool:
     return True
 
 
-async def _publish_report_task(channel, project_id: str):
+async def _publish_report_task(channel, project_id: str, force: bool = False, is_dev: bool = False):
     """Send a clean task message to the report generator queue."""
-    task = {"project_id": project_id}
+    task = {"project_id": project_id, "force": force, "dev_mode": is_dev}
     msg = aio_pika.Message(
         json.dumps(task).encode(),
         delivery_mode=aio_pika.DeliveryMode.PERSISTENT
@@ -537,7 +603,7 @@ async def _publish_report_task(channel, project_id: str):
         await channel.default_exchange.publish(msg, routing_key="wsc_report_tasks")
     elif hasattr(channel, "basic_publish"):
         await channel.basic_publish(msg.body, exchange="", routing_key="wsc_report_tasks")
-    logger.info(f"Dispatcher: Published report task for {project_id}")
+    logger.info(f"Dispatcher: Published report task for {project_id} (force={force}, is_dev={is_dev})")
 
 
 async def _trigger_resync_reports(channel, project_id: str):
@@ -568,14 +634,47 @@ async def handle_report_task(message: aio_pika.IncomingMessage):
     Receives tasks only for projects where the dispatcher decided a report is needed.
     """
     try:
-        body = json.loads(message.body.decode()) if message.body else {}
-        project_id = body.get("project_id")
-        if project_id:
-            await generate_reports_for_project(project_id)
+        raw_bytes = message.body or b""
+        if not raw_bytes or not raw_bytes.strip():
+            await message.ack()
+            return
+
+        try:
+            body = json.loads(raw_bytes.decode("utf-8"))
+        except Exception as je:
+            logger.warning(f"Report generator received unparseable non-JSON payload ({je}): {raw_bytes[:200]}")
+            await message.ack()
+            return
+
+        pids = []
+        if isinstance(body, dict):
+            pid = body.get("project_id")
+            if pid:
+                pids.append(pid)
+        elif isinstance(body, list):
+            for elem in body:
+                if isinstance(elem, dict) and elem.get("project_id"):
+                    pids.append(elem.get("project_id"))
+                elif isinstance(elem, str) and elem.strip():
+                    pids.append(elem.strip())
+        elif isinstance(body, str) and body.strip():
+            pids.append(body.strip())
+        else:
+            logger.warning(f"Report generator received unexpected payload type ({type(body)}): {body}")
+            await message.ack()
+            return
+
+        for pid in pids:
+            await generate_reports_for_project(pid)
+
         await message.ack()
     except Exception as e:
-        logger.error(f"Error in report task handler: {e}")
-        await message.nack(requeue=True)
+        logger.error(f"Error in report task handler: {e}", exc_info=True)
+        if getattr(message, "redelivered", False):
+            logger.warning("Report generator: Task was already redelivered; dropping to prevent crash loop.")
+            await message.ack()
+        else:
+            await message.nack(requeue=False)
 
 
 async def get_active_projects(limit: int = 20) -> list:
@@ -1120,23 +1219,38 @@ async def assemble_card1_traffic_report(project_id: str):
         top_pages = _get_top_pages(project_id, start_date)
         top_referrers = _get_top_referrers(project_id, start_date, sources)
 
-        # Sparkline: always exactly 7 points for the trend
+        # Sparkline: always exactly 7 chronological points for the trend
         sparkline = []
-        step = max(1, days // 7) if days > 0 else 1
-        for i in range(7):
-            idx = i * step
-            if idx < len(daily_totals_sorted):
-                d, vals = daily_totals_sorted[idx]
+        today_date = now.date()
+        if days <= 7:
+            for i in range(7):
+                pt_date = today_date - timedelta(days=(6 - i))
+                vals = daily_totals.get(pt_date, {})
                 sparkline.append({
-                    "date": str(d),
+                    "date": str(pt_date),
                     "unique_visitors": vals.get("unique_visitors", 0),
                     "pageviews": vals.get("pageviews", 0)
                 })
-            else:
-                if sparkline:
-                    sparkline.append(sparkline[-1].copy())
-                else:
-                    sparkline.append({"date": "", "unique_visitors": 0, "pageviews": 0})
+        else:
+            bucket_size = days / 7.0
+            for i in range(7):
+                b_start = start_date + timedelta(days=int(i * bucket_size))
+                b_end = start_date + timedelta(days=min(days - 1, int((i + 1) * bucket_size) - 1))
+                if b_end < b_start:
+                    b_end = b_start
+                b_pv = 0
+                b_uv = 0
+                curr = b_start
+                while curr <= b_end:
+                    v = daily_totals.get(curr, {})
+                    b_pv += v.get("pageviews", 0)
+                    b_uv += v.get("unique_visitors", 0)
+                    curr += timedelta(days=1)
+                sparkline.append({
+                    "date": str(b_end),
+                    "unique_visitors": b_uv,
+                    "pageviews": b_pv
+                })
 
         # find top source
         top_source = max(sources, key=lambda s: sources[s]["pageviews"]) if sources else "direct"
