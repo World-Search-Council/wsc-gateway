@@ -30,11 +30,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [sen
 logger = logging.getLogger("sentinel_worker")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+REDIS_CLUSTER_MODE = os.getenv("REDIS_CLUSTER_MODE", "false").strip().lower() in ("1", "true", "yes")
 
 
 def get_redis_client():
     try:
-        client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=3.0)
+        if REDIS_CLUSTER_MODE:
+            from redis.cluster import RedisCluster
+            client = RedisCluster.from_url(REDIS_URL, decode_responses=True, socket_timeout=3.0)
+        else:
+            client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=3.0)
         client.ping()
         return client
     except Exception as e:

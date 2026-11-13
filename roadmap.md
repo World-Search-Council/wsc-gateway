@@ -1,9 +1,9 @@
 # WSC Gateway & Backend – Roadmap (Gateway + Worker + Pipeline)
 
 **Modul:** WSC Gateway & Analytical Worker Pipeline  
-**Aktuelle Version:** 1.5.1  
-**Status:** Release-Bereit / 7-Card Suite & Pure Push-Report Pipeline Live  
-**Letztes Update:** 1. September 2026 (Pure Gateway Push-Report Paradigm, ClickHouse MVs, E-Commerce & Engagement Assembler)  
+**Aktuelle Version:** 2.3.0  
+**Status:** Production LIVE (`https://api.worldsearchcouncil.org`) — 7-Card Suite, Pure Push-Report Pipeline, CloudAMQP + Aiven ClickHouse OLAP, Redis Cluster & Prometheus `/metrics`  
+**Letztes Update:** 13. November 2026 (Production Cutover auf CloudAMQP & Aiven ClickHouse TLS, Redis Cluster Adapter, Prometheus OpenMetrics Exporter)  
 **Strategie:** Push-basiert (Zentrale ClickHouse-Aggregation → Python-Worker Report Assembly → HMAC Webhook Push)
 
 ---
@@ -65,11 +65,11 @@ Alle Rohdaten werden in ClickHouse aggregiert. Die fertigen Reports werden per *
 - [x] Strikte Zero-Local-Aggregation im CMS (WordPress) durch reine SQLite-Report-Reader
 - [x] Datenschutz-Standard 1.5.0 (Zero-IP-Persistence, Daily Rotating Salt)
 
-### Phase 4: Stabilität & Skalierung (Laufend)
-- [x] Gestaffelte Retry-Queues (5m / 1h)
-- [x] Multi-Worker Orchestrierung (`ingest.py`, `dispatcher.py`, `report_generator.py`)
-- [ ] Redis Cluster Support für High-Scale Deployments
-- [ ] Prometheus / Grafana Metrik-Exporte für Queue-Latenzen
+### Phase 4: Stabilität & Skalierung (Abgeschlossen)
+- [x] Gestaffelte Retry-Queues (5m / 1h) & DLQ (`wsc_raw_events.dlq`)
+- [x] Multi-Worker Orchestrierung (`ingest.py`, `dispatcher.py`, `report_generator.py`, `pagespeed_worker.py`, `sentinel_worker.py`)
+- [x] Redis Cluster Support (`REDIS_CLUSTER_MODE` / `REDIS_CLUSTER_NODES`) inkl. L1-Failover-Cache für High-Scale Deployments
+- [x] Prometheus / Grafana OpenMetrics Exporter (`GET /metrics`) für Queue-Tiefen, DLX-Retries, HTTP-Histogramme & ClickHouse-Latenzen
 
 ### Phase 5: Microservice Mesh, SpeedSentinel & Cross-Domain Intelligence (Abgeschlossen)
 - [x] **SpeedSentinel Playwright Engine (`/v1/pagespeed`)**:

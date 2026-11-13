@@ -50,6 +50,10 @@ CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8443))
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
 CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASS")
+CLICKHOUSE_SECURE = os.getenv(
+    "CLICKHOUSE_SECURE",
+    "false" if CLICKHOUSE_PORT in (8123, 9000) else "true"
+).strip().lower() in ("1", "true", "yes")
 
 # Globale DB-Verbindung & GeoIP
 ch_client = None
@@ -429,7 +433,8 @@ def _init_clickhouse():
                 username=CLICKHOUSE_USER,
                 password=CLICKHOUSE_PASS,
                 connect_timeout=30,
-                send_receive_timeout=45
+                send_receive_timeout=45,
+                secure=CLICKHOUSE_SECURE
             )
             client.command("SELECT 1")
             logger.info("ClickHouse ist wach und verbunden!")

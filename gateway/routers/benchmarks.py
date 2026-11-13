@@ -171,12 +171,32 @@ async def query_benchmark(request: Request, x_wsc_sig: str = Header(None, alias=
 
     # Authenticate via HMAC
     redis_client = getattr(request.app.state, "redis", None)
-    api_secret = "dev_secret"
+    db_pool = getattr(request.app.state, "db_pool", None)
+    api_secret = None
     if redis_client:
-        cached_secret = await redis_client.get(f"proj_sec:{project_id}")
-        if cached_secret:
-            api_secret = cached_secret
+        cached_proj = await redis_client.get(f"project:{project_id}")
+        if cached_proj:
+            try:
+                api_secret = json.loads(cached_proj).get("api_secret")
+            except Exception:
+                pass
+        if not api_secret:
+            api_secret = await redis_client.get(f"proj_sec:{project_id}")
 
+    if not api_secret and db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT api_secret FROM projects WHERE uuid = %s AND status != 999", (project_id,))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        api_secret = row[0]
+                        if redis_client:
+                            await redis_client.set(f"proj_sec:{project_id}", api_secret, ex=86400)
+        except Exception as e:
+            logger.warning(f"DB lookup for benchmark HMAC failed: {e}")
+
+    api_secret = api_secret or "dev_secret"
     expected_sig = hmac.new(api_secret.encode(), body_bytes, hashlib.sha256).hexdigest()
     if x_wsc_sig and not hmac.compare_digest(expected_sig, x_wsc_sig):
         raise HTTPException(status_code=403, detail="Invalid HMAC signature")

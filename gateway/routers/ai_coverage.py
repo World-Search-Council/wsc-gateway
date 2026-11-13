@@ -161,7 +161,7 @@ async def query_ai_coverage(
                     uniqIf(url_path, event_type = 'bot_hit' AND bot_type = 'training') as training_urls
                 FROM wsc_analytics_raw
                 WHERE root_domain = %(dom)s
-                  AND timestamp >= now() - INTERVAL 30 DAY
+                  AND timestamp >= toUnixTimestamp(now() - INTERVAL 30 DAY)
             """
             dom_row = ch_client.query(dom_query, parameters={"dom": query_ctx.root_domain}).first_row
             if dom_row and dom_row[0] > 0:
@@ -184,16 +184,16 @@ async def query_ai_coverage(
             url_query = """
                 SELECT
                     count() as total_hits,
-                    countIf(event_type = 'bot_hit' AND bot_type = 'rag' AND timestamp >= now() - INTERVAL 7 DAY) as rag_7d,
-                    countIf(event_type = 'bot_hit' AND bot_type = 'rag' AND timestamp >= now() - INTERVAL 30 DAY) as rag_30d,
-                    maxIf(toUnixTimestamp(timestamp), event_type = 'bot_hit' AND bot_type = 'rag') as last_rag,
-                    countIf(event_type = 'bot_hit' AND bot_type = 'training' AND timestamp >= now() - INTERVAL 7 DAY) as train_7d,
-                    countIf(event_type = 'bot_hit' AND bot_type = 'training' AND timestamp >= now() - INTERVAL 30 DAY) as train_30d,
-                    maxIf(toUnixTimestamp(timestamp), event_type = 'bot_hit' AND bot_type = 'training') as last_train
+                    countIf(event_type = 'bot_hit' AND bot_type = 'rag' AND timestamp >= toUnixTimestamp(now() - INTERVAL 7 DAY)) as rag_7d,
+                    countIf(event_type = 'bot_hit' AND bot_type = 'rag' AND timestamp >= toUnixTimestamp(now() - INTERVAL 30 DAY)) as rag_30d,
+                    maxIf(timestamp, event_type = 'bot_hit' AND bot_type = 'rag') as last_rag,
+                    countIf(event_type = 'bot_hit' AND bot_type = 'training' AND timestamp >= toUnixTimestamp(now() - INTERVAL 7 DAY)) as train_7d,
+                    countIf(event_type = 'bot_hit' AND bot_type = 'training' AND timestamp >= toUnixTimestamp(now() - INTERVAL 30 DAY)) as train_30d,
+                    maxIf(timestamp, event_type = 'bot_hit' AND bot_type = 'training') as last_train
                 FROM wsc_analytics_raw
                 WHERE root_domain = %(dom)s
                   AND url_path = %(path)s
-                  AND timestamp >= now() - INTERVAL 30 DAY
+                  AND timestamp >= toUnixTimestamp(now() - INTERVAL 30 DAY)
             """
             url_row = ch_client.query(url_query, parameters={"dom": query_ctx.root_domain, "path": query_ctx.url_path}).first_row
             
@@ -208,7 +208,7 @@ async def query_ai_coverage(
                     WHERE root_domain = %(dom)s
                       AND url_path = %(path)s
                       AND event_type = 'bot_hit'
-                      AND timestamp >= now() - INTERVAL 30 DAY
+                      AND timestamp >= toUnixTimestamp(now() - INTERVAL 30 DAY)
                     GROUP BY bot_type, bot_name
                     ORDER BY cnt DESC
                     LIMIT 10

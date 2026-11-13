@@ -256,7 +256,27 @@ CREATE TABLE IF NOT EXISTS wsc_outbound_daily (
     last_clicked  SimpleAggregateFunction(max, UInt32)
 ) ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(date)
-ORDER BY (project_id, date, target_host, target_url, source_url);
+ORDER BY (project_id, date, target_host, target_url, source_url, category);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_wsc_outbound_daily
+TO wsc_outbound_daily AS
+SELECT
+    project_id,
+    toDate(toDateTime(timestamp)) AS date,
+    if(JSONExtractString(custom_data, 'hostname') != '', JSONExtractString(custom_data, 'hostname'), domain(JSONExtractString(custom_data, 'href'))) AS target_host,
+    if(JSONExtractString(custom_data, 'href') != '', JSONExtractString(custom_data, 'href'), JSONExtractString(custom_data, 'url')) AS target_url,
+    url_path AS source_url,
+    multiIf(
+        multiSearchAny(lower(JSONExtractString(custom_data, 'href')), ['join.com', 'personio', 'career', 'jobs', 'recruitee', 'greenhouse', 'lever.co']), 'jobs',
+        multiSearchAny(lower(JSONExtractString(custom_data, 'href')), ['linkedin.com', 'twitter.com', 'x.com', 'instagram.com', 'youtube.com', 'facebook.com', 'tiktok.com', 'github.com']), 'social',
+        multiSearchAny(lower(JSONExtractString(custom_data, 'href')), ['affiliate', 'partner', 'ref=', 'amzn.to']), 'affiliate',
+        'reference'
+    ) AS category,
+    count() AS clicks_count,
+    max(timestamp) AS last_clicked
+FROM wsc_analytics_raw
+WHERE bot_name = '' AND event_type = 'outbound_click'
+GROUP BY project_id, date, target_host, target_url, source_url, category;
 
 -- E-Commerce Reality & Conversion Funnel
 CREATE TABLE IF NOT EXISTS wsc_ecommerce_daily (
@@ -272,3 +292,20 @@ CREATE TABLE IF NOT EXISTS wsc_ecommerce_daily (
 ) ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(date)
 ORDER BY (project_id, date);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_wsc_ecommerce_daily
+TO wsc_ecommerce_daily AS
+SELECT
+    project_id,
+    toDate(toDateTime(timestamp)) AS date,
+    countIf(event_type = 'product_view' OR (event_type = 'pageview' AND JSONExtractString(custom_data, 'page_type') = 'product')) AS product_views,
+    countIf(event_type = 'add_to_cart') AS add_to_cart_count,
+    countIf(event_type IN ('initiate_checkout', 'begin_checkout')) AS initiate_checkout,
+    countIf(event_type = 'purchase' OR (event_type = 'conversion' AND JSONExtractString(custom_data, 'conversion_type') = 'purchase')) AS purchases_count,
+    sum(if(event_type = 'purchase' OR (event_type = 'conversion' AND JSONExtractString(custom_data, 'conversion_type') = 'purchase'), JSONExtractFloat(custom_data, 'revenue'), 0.0)) AS revenue,
+    countIf((event_type = 'purchase' OR (event_type = 'conversion' AND JSONExtractString(custom_data, 'conversion_type') = 'purchase')) AND (length(JSONExtractArrayRaw(custom_data, 'coupons')) > 0 OR JSONExtractString(custom_data, 'coupon_code') != '')) AS orders_with_coupon,
+    sum(if(event_type = 'purchase' OR (event_type = 'conversion' AND JSONExtractString(custom_data, 'conversion_type') = 'purchase'), JSONExtractFloat(custom_data, 'discount'), 0.0)) AS coupon_discount_sum
+FROM wsc_analytics_raw
+WHERE bot_name = ''
+  AND event_type IN ('product_view', 'pageview', 'add_to_cart', 'initiate_checkout', 'begin_checkout', 'purchase', 'conversion')
+GROUP BY project_id, date;

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -9,10 +10,11 @@ import json
 import uuid
 import datetime
 import httpx
-import redis.asyncio as redis
 import aio_pika
 from aio_pika import ExchangeType
 import aiomysql
+from services.redis_cache import create_async_redis_client
+from services.metrics import METRICS
 from routers.shopify import router as shopify_router
 from routers.ai_coverage import router as ai_coverage_router
 from routers.benchmarks import router as benchmarks_router
@@ -21,7 +23,10 @@ from routers.pagespeed import pagespeed_router
 from routers.intelligence import router as intelligence_router
 from routers.reports import router as reports_router
 
-app = FastAPI(title="WSC Analytics Gateway")
+GATEWAY_VERSION = "2.3.0"
+STANDARD_SPEC_VERSION = "1.5.0"
+
+app = FastAPI(title="WSC Analytics Gateway", version=GATEWAY_VERSION)
 app.include_router(shopify_router)
 app.include_router(ai_coverage_router)
 app.include_router(benchmarks_router)
@@ -33,11 +38,11 @@ app.include_router(reports_router)
 
 # Common probe paths that scanners look for (return 404 quickly)
 BLOCKED_PATH_PREFIXES = [
-    "/wp-", "/xmlrpc", "/console", "/server", "/.env", "/.git", 
-    "/graphql", "/api/", "/actuator", "/telescope", "/debug", 
-    "/login", "/config.json", "/.vscode", "/robots.txt", 
-    "/favicon.ico", "/version", "/info.php", "/trace.axd", 
-    "/.DS_Store", "/ecp/", "/___proxy", "/v2/_catalog", 
+    "/wp-", "/xmlrpc", "/console", "/server", "/.env", "/.git",
+    "/graphql", "/api/", "/actuator", "/telescope", "/debug",
+    "/login", "/config.json", "/.vscode",
+    "/favicon.ico", "/version", "/info.php", "/trace.axd",
+    "/.DS_Store", "/ecp/", "/___proxy", "/v2/_catalog",
     "/s/", "/?rest_route", "/healthz", "/.well-known/security.txt"
 ]
 
@@ -47,15 +52,20 @@ async def security_middleware(request: Request, call_next):
     # Quick block for obvious scanner probes (best practice to reduce noise)
     if any(path.startswith(prefix.lower()) or prefix.lower() in path for prefix in BLOCKED_PATH_PREFIXES):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
-    
+
+    t0 = time.perf_counter()
     response = await call_next(request)
+    duration_sec = time.perf_counter() - t0
+    if path != "/metrics":
+        METRICS.observe_http(request.method, request.url.path, response.status_code, duration_sec)
+
     # Add basic security headers (Traefik also adds some)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
 @app.get("/health")
-async def health_check():
+async def liveness_check():
     """Simple health endpoint for monitoring / load balancers."""
     return {"status": "healthy"}
 
@@ -64,13 +74,31 @@ async def robots_txt():
     """Tell bots to go away."""
     return PlainTextResponse("User-agent: *\nDisallow: /", media_type="text/plain")
 
+@app.get("/metrics")
+async def prometheus_metrics(request: Request, authorization: str = Header(None)):
+    """Prometheus & Grafana OpenMetrics endpoint (Prio 5.2)."""
+    expected_token = os.getenv("METRICS_BEARER_TOKEN", "").strip()
+    if expected_token:
+        supplied = ""
+        if authorization and authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+        if not supplied or not hmac.compare_digest(supplied, expected_token):
+            raise HTTPException(status_code=401, detail="Unauthorized metrics scrape")
+
+    body = await METRICS.render_prometheus(
+        request.app.state,
+        version=GATEWAY_VERSION,
+        spec=STANDARD_SPEC_VERSION,
+    )
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
 # Globale Verbindungen
 redis_client = None
+rabbitmq_connection = None
 rabbitmq_channel = None
 db_pool = None
 
 # --- KONFIGURATION ---
-# 195.149.93.135:9006
 DB_CONFIG = {
     'host': os.getenv('DB_HOST'),
     'port': int(os.getenv('DB_PORT', 9006)),
@@ -87,6 +115,10 @@ CLICKHOUSE_HOST = os.getenv('CLICKHOUSE_HOST')
 CLICKHOUSE_PORT = int(os.getenv('CLICKHOUSE_PORT', 8443))
 CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER')
 CLICKHOUSE_PASS = os.getenv('CLICKHOUSE_PASS')
+CLICKHOUSE_SECURE = os.getenv(
+    'CLICKHOUSE_SECURE',
+    'false' if CLICKHOUSE_PORT in (8123, 9000) else 'true'
+).strip().lower() in ('1', 'true', 'yes')
 
 # --- HILFSFUNKTION ---
 def get_real_ip(request: Request) -> str:
@@ -121,12 +153,12 @@ class InsightPayload(BaseModel):
 # --- LIFECYCLE ---
 @app.on_event("startup")
 async def startup_event():
-    global redis_client, rabbitmq_channel, db_pool
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    
+    global redis_client, rabbitmq_connection, rabbitmq_channel, db_pool
+    redis_client = create_async_redis_client()
+
     try:
-        connection = await aio_pika.connect_robust(RABBITMQ_URL)
-        rabbitmq_channel = await connection.channel()
+        rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL)
+        rabbitmq_channel = await rabbitmq_connection.channel()
         await rabbitmq_channel.declare_exchange("wsc.dlx", ExchangeType.DIRECT, durable=True)
 
         # Main processing queue with dead-letter
@@ -151,8 +183,9 @@ async def startup_event():
             }
         )
 
-        # Trigger queue for scheduled report generation (consumed by worker)
+        # Trigger & worker queues for report generation
         await rabbitmq_channel.declare_queue("wsc_trigger_reports", durable=True)
+        await rabbitmq_channel.declare_queue("wsc_report_tasks", durable=True)
 
         # Queue for asynchronous PageSpeed & Core Web Vitals audits (consumed by pagespeed_worker)
         await rabbitmq_channel.declare_queue("wsc_pagespeed_tasks", durable=True)
@@ -177,10 +210,12 @@ async def startup_event():
 
     except Exception as e:
         print(f"⚠️ RabbitMQ noch nicht erreichbar: {e}")
-    
+
     db_pool = await aiomysql.create_pool(**DB_CONFIG, minsize=1, maxsize=10)
     app.state.redis = redis_client
+    app.state.redis_client = redis_client
     app.state.db_pool = db_pool
+    app.state.rabbitmq_connection = rabbitmq_connection
     app.state.rabbitmq_channel = rabbitmq_channel
 
     # Initialize ClickHouse Client
@@ -194,19 +229,24 @@ async def startup_event():
                 password=CLICKHOUSE_PASS,
                 connect_timeout=15,
                 send_receive_timeout=30,
-                secure=True if CLICKHOUSE_PORT == 8443 else False
+                secure=CLICKHOUSE_SECURE
             )
+            ch_client.command("SELECT 1")
             app.state.clickhouse = ch_client
-            print("🚀 ClickHouse Client verbunden.")
+            print(f"🚀 ClickHouse Client verbunden ({CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}, secure={CLICKHOUSE_SECURE}).")
         except Exception as e:
             print(f"⚠️ ClickHouse Verbindungsfehler: {e}")
             app.state.clickhouse = None
 
-    print("🚀 WSC Gateway gestartet.")
+    print(f"🚀 WSC Gateway v{GATEWAY_VERSION} gestartet (Redis mode: {getattr(redis_client, 'mode_label', 'standalone')}).")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    if redis_client:
+        await redis_client.close()
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        await rabbitmq_connection.close()
     if db_pool:
         db_pool.close()
         await db_pool.wait_closed()
@@ -217,8 +257,11 @@ async def health_check():
     return {
         "status": "active",
         "service": "WSC Gateway",
-        "version": "2.0.0",
-        "standard_spec": "1.5.0",
+        "version": GATEWAY_VERSION,
+        "standard_spec": STANDARD_SPEC_VERSION,
+        "redis_mode": getattr(redis_client, "mode_label", "standalone"),
+        "clickhouse_connected": getattr(app.state, "clickhouse", None) is not None,
+        "rabbitmq_connected": rabbitmq_connection is not None and not rabbitmq_connection.is_closed,
         "timestamp": int(datetime.datetime.utcnow().timestamp())
     }
 
@@ -226,11 +269,9 @@ async def health_check():
 @app.post("/v1/register")
 async def register_project(req: RegisterRequest, request: Request):
     client_ip = get_real_ip(request)
-    
-    # NEU: Wir entfernen nur noch einen eventuellen Slash am Ende. 
-    # Die Domain bleibt "https://www.searchneedslove.com", damit Webhooks später ankommen!
+
     wp_base_url = req.domain.rstrip('/')
-    
+
     project_uuid = f"proj_{uuid.uuid4().hex[:16]}"
     api_secret = uuid.uuid4().hex
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -240,22 +281,21 @@ async def register_project(req: RegisterRequest, request: Request):
             async with conn.cursor() as cur:
                 # Mark any older project registrations for this domain as superseded (status=999)
                 await cur.execute("UPDATE projects SET status = 999 WHERE domain = %s AND status = 0", (wp_base_url,))
-                
+
                 query = """
                     INSERT INTO projects 
-                    (uuid, domain, api_secret, local_aes_key, registered_ip, status, created, updated)
-                    VALUES (%s, %s, %s, %s, %s, 0, %s, %s)
+                    (uuid, domain, api_secret, local_aes_key, registered_ip, platform, status, created, updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s)
                 """
                 await cur.execute(query, (
-                    project_uuid, wp_base_url, api_secret, req.local_aes_key, client_ip, now, now
+                    project_uuid, wp_base_url, api_secret, req.local_aes_key, client_ip, req.platform.lower(), now, now
                 ))
     except Exception as e:
         print(f"DB Error: {e}")
         raise HTTPException(status_code=500, detail="Database error during registration")
 
-    # In den Cache schieben (NEU: Domain, Platform und Webhook URL mitgecacht)
     cache_data = {
-        "api_secret": api_secret, 
+        "api_secret": api_secret,
         "local_aes_key": req.local_aes_key,
         "domain": wp_base_url,
         "platform": req.platform.lower(),
@@ -263,45 +303,51 @@ async def register_project(req: RegisterRequest, request: Request):
         "status": 0
     }
     await redis_client.set(f"project:{project_uuid}", json.dumps(cache_data), ex=86400)
-    
+    await redis_client.set(f"proj_sec:{project_uuid}", api_secret, ex=86400)
+
     return {"project_id": project_uuid, "api_secret": api_secret}
 
 # --- ROUTE 2: INGESTION (Tracking Daten Empfang) ---
 @app.post("/v1/ingest")
 async def ingest_data(payload: IngestPayload, request: Request, x_wsc_sig: str = Header(None)):
     if not x_wsc_sig:
+        METRICS.record_ingest("rejected")
         raise HTTPException(status_code=401, detail="Missing Signature")
 
     project_uuid = payload.project_id
     cached_project = await redis_client.get(f"project:{project_uuid}")
-    
+
     if not cached_project:
         async with db_pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute("SELECT api_secret, local_aes_key, domain, status FROM projects WHERE uuid = %s", (project_uuid,))
+                await cur.execute("SELECT api_secret, local_aes_key, domain, platform, status FROM projects WHERE uuid = %s", (project_uuid,))
                 row = await cur.fetchone()
                 if not row:
+                    METRICS.record_ingest("rejected")
                     raise HTTPException(status_code=404, detail="Project not found")
-                
+
                 project_data = {
                     "api_secret": row['api_secret'],
                     "local_aes_key": row['local_aes_key'],
                     "domain": row['domain'],
-                    "platform": "wordpress",
+                    "platform": (row.get('platform') or "wordpress").lower(),
                     "webhook_url": "",
                     "status": row['status']
                 }
                 await redis_client.set(f"project:{project_uuid}", json.dumps(project_data), ex=86400)
+                await redis_client.set(f"proj_sec:{project_uuid}", row['api_secret'], ex=86400)
     else:
         project_data = json.loads(cached_project)
 
     if project_data["status"] == 999:
+        METRICS.record_ingest("rejected")
         raise HTTPException(status_code=403, detail="Project is blocked")
 
     raw_body = await request.body()
     expected_sig = hmac.new(project_data["api_secret"].encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sig, x_wsc_sig):
+        METRICS.record_ingest("rejected")
         raise HTTPException(status_code=401, detail="Invalid Signature")
 
     # Normalize to list of dicts with "payload" key so workerV3 can consume uniformly
@@ -312,7 +358,7 @@ async def ingest_data(payload: IngestPayload, request: Request, x_wsc_sig: str =
 
     worker_message = {
         "project_id": project_uuid,
-        "local_aes_key": project_data.get("local_aes_key", ""), 
+        "local_aes_key": project_data.get("local_aes_key", ""),
         "raw_events": raw_events
     }
 
@@ -320,7 +366,9 @@ async def ingest_data(payload: IngestPayload, request: Request, x_wsc_sig: str =
         message = aio_pika.Message(body=json.dumps(worker_message).encode(), delivery_mode=aio_pika.DeliveryMode.PERSISTENT)
         await rabbitmq_channel.default_exchange.publish(message, routing_key="wsc_raw_events")
 
-    return {"status": "ok", "queued_events": len(payload.data)}
+    events_len = len(payload.data) if isinstance(payload.data, list) else 0
+    METRICS.record_ingest("queued", events_count=events_len)
+    return {"status": "ok", "queued_events": events_len}
 
 # --- ROUTE 3: WEBHOOK DISPATCHER (Cross-Platform) ---
 @app.post("/internal/dispatch-insights")
@@ -330,7 +378,7 @@ async def dispatch_insights(payload: InsightPayload):
     3-Card insights to remote CMS/Shop instances (WordPress, Drupal, Joomla, Shopware, Magento).
     """
     project_uuid = payload.project_id
-    
+
     # 1. Projektdaten laden
     cached_project = await redis_client.get(f"project:{project_uuid}")
     if not cached_project:
@@ -339,7 +387,7 @@ async def dispatch_insights(payload: InsightPayload):
             try:
                 async with db_pool.acquire() as conn:
                     async with conn.cursor(aiomysql.DictCursor) as cur:
-                        await cur.execute("SELECT api_secret, domain, status FROM projects WHERE uuid = %s", (project_uuid,))
+                        await cur.execute("SELECT api_secret, domain, platform, status FROM projects WHERE uuid = %s", (project_uuid,))
                         row = await cur.fetchone()
                 break
             except Exception as e:
@@ -353,11 +401,12 @@ async def dispatch_insights(payload: InsightPayload):
         project_data = {
             "api_secret": row['api_secret'],
             "domain": row['domain'],
-            "platform": "wordpress",
+            "platform": (row.get('platform') or "wordpress").lower(),
             "webhook_url": "",
             "status": row['status']
         }
         await redis_client.set(f"project:{project_uuid}", json.dumps(project_data), ex=86400)
+        await redis_client.set(f"proj_sec:{project_uuid}", row['api_secret'], ex=86400)
     else:
         project_data = json.loads(cached_project)
         if "domain" not in project_data:
@@ -383,7 +432,7 @@ async def dispatch_insights(payload: InsightPayload):
 
     # 3. Assemble canonical 3-card and legacy insights payload
     payload_dict = {
-        "version": "1.5.0",
+        "version": STANDARD_SPEC_VERSION,
         "updated_at": int(datetime.datetime.utcnow().timestamp()),
         "insights": payload.insights or []
     }
@@ -414,8 +463,8 @@ async def dispatch_insights(payload: InsightPayload):
 
     # 4. Den HMAC-SHA256 für den Webhook-Empfänger berechnen
     signature = hmac.new(
-        project_data["api_secret"].encode('utf-8'), 
-        request_body_str.encode('utf-8'), 
+        project_data["api_secret"].encode('utf-8'),
+        request_body_str.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
 
@@ -432,7 +481,9 @@ async def dispatch_insights(payload: InsightPayload):
                 timeout=10.0
             )
             response.raise_for_status()
+            METRICS.record_webhook(platform, "success")
             return {"status": "success", "platform": platform, "target": webhook_url, "response": response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text}
         except Exception as e:
+            METRICS.record_webhook(platform, "failed")
             print(f"❌ Webhook dispatch failed to {webhook_url} ({platform}): {e}")
             raise HTTPException(status_code=500, detail=f"Webhook dispatch failed: {e}")
