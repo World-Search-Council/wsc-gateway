@@ -148,6 +148,10 @@ class InsightPayload(BaseModel):
     card1: dict = None
     card2: dict = None
     card3: dict = None
+    card_engagement: dict = None
+    card_outbound: dict = None
+    card_ecommerce: dict = None
+    domain_health: dict = None
     pagespeed: dict = None
 
 # --- LIFECYCLE ---
@@ -443,10 +447,18 @@ async def dispatch_insights(payload: InsightPayload):
         payload_dict["card2"] = payload.card2
     if payload.card3:
         payload_dict["card3"] = payload.card3
+    if payload.card_engagement:
+        payload_dict["card_engagement"] = payload.card_engagement
+    if payload.card_outbound:
+        payload_dict["card_outbound"] = payload.card_outbound
+    if payload.card_ecommerce:
+        payload_dict["card_ecommerce"] = payload.card_ecommerce
+    if payload.domain_health:
+        payload_dict["domain_health"] = payload.domain_health
     if payload.pagespeed:
         payload_dict["pagespeed"] = payload.pagespeed
 
-    # Extract 3-cards and pagespeed from insight items if passed in legacy list
+    # Extract 7-cards, sentinel and pagespeed from insight items if passed in list
     for item in payload.insights:
         if isinstance(item, dict):
             rtype = item.get("report_type") or item.get("type", "")
@@ -456,6 +468,14 @@ async def dispatch_insights(payload: InsightPayload):
                 payload_dict["card2"] = item
             elif (rtype in ("card3_bots", "card3") or rtype.startswith("card3")) and "card3" not in payload_dict:
                 payload_dict["card3"] = item
+            elif rtype in ("card_engagement", "card4") and "card_engagement" not in payload_dict:
+                payload_dict["card_engagement"] = item
+            elif rtype in ("card_outbound", "card5") and "card_outbound" not in payload_dict:
+                payload_dict["card_outbound"] = item
+            elif rtype in ("card_ecommerce", "card6") and "card_ecommerce" not in payload_dict:
+                payload_dict["card_ecommerce"] = item
+            elif rtype in ("domain_health", "sentinel", "card7") and "domain_health" not in payload_dict:
+                payload_dict["domain_health"] = item
             elif (rtype in ("pagespeed_audit", "pagespeed", "card_pagespeed")) and "pagespeed" not in payload_dict:
                 payload_dict["pagespeed"] = item
 
